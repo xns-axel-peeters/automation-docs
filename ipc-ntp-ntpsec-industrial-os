@@ -1,0 +1,278 @@
+# IPC (Industrial OS) as NTP Server and NTP Client (ntpsec)
+
+*NL: Deze handleiding beschrijft hoe je een Siemens IPC met Industrial OS instelt als NTP-client van een centrale server én als NTP-server voor het OT/voertuignetwerk.*
+
+---
+
+## 1. Goal / Scope
+
+Configure a Siemens IPC running **Industrial OS** (Debian‑based) so that:
+
+1. The IPC **synchronizes its time** from a **central NTP server** (e.g. IT/plant network).
+2. The IPC **acts as an NTP server** for the OT / vehicle network (e.g. PLCs, HMIs, Scanners).
+3. If the central NTP server becomes unavailable, all OT components **still share the same time**, using the IPC as fallback time master (orphan mode).
+
+NL: Doel: IPC haalt tijd bij een centrale NTP‑server en deelt die tijd uit aan het OT‑net. Valt de centrale server weg, dan blijft de IPC intern tijd verdelen zodat alle componenten dezelfde tijd blijven houden.
+
+---
+
+## 2. Assumptions / Example IPs
+
+Adjust the IP addresses to your own environment. Example values:
+
+- IPC (Industrial OS): `172.21.35.12`
+- OT / vehicle network: `172.21.35.0/24`
+- Upstream NTP server (IT/dev/customer): `10.10.10.10` (replace with real IP)
+
+Industrial OS uses **ntpsec/ntpd** by default, with config file:
+
+/etc/ntpsec/ntp.conf
+
+NL: Pas de IP‑adressen aan naar je eigen situatie. Industrial OS gebruikt standaard ntpsec, geen chrony. We passen dus de ntpsec‑config aan.
+
+---
+
+## 3. Basic checks on the IPC
+
+### 3.1. Log in to the IPC
+Log in via console or SSH: ssh <user>@172.21.35.12
+
+NL: Log in op de IPC (via console of SSH).
+
+### 3.2. Check current time status
+timedatectl
+
+Check:
+- Whether the local time is roughly correct.
+- On Industrial OS, `NTP service: n/a` is normal (ntpsec is separate from systemd‑timesyncd).
+
+NL: `timedatectl` geeft een indicatie of de tijd ongeveer klopt. `NTP service: n/a` is oké op Industrial OS.
+
+### 3.3. Check which NTP daemon is running
+ps aux | grep -E 'ntp|ntpd|ntpsec|chrony|timesyncd' | grep -v grep
+
+You should see something like:
+/usr/sbin/ntpd -g -u ntpsec:ntpsec -c /etc/ntpsec/ntp.conf ...
+
+This means **ntpsec/ntpd** is running and using `/etc/ntpsec/ntp.conf`.
+
+NL: Controleer dat ntpsec/ntpd draait en welk configbestand gebruikt wordt.
+
+---
+
+## 4. Backup and open the ntpsec configuration
+
+### 4.1. Create a backup
+sudo cp /etc/ntpsec/ntp.conf /etc/ntpsec/ntp.conf.bak
+
+NL: Maak altijd eerst een back‑up van de config voordat je wijzigt.
+
+### 4.2. Open the configuration file
+sudo nano /etc/ntpsec/ntp.conf
+
+Make sure:
+- Line 1 starts with a simple comment, for example:
+  # ntpsec configuration
+- There are no strange invisible characters or stray quotes on the first line.
+
+NL: Zorg dat de eerste regel een normale comment is, zonder rare tekens. Dat voorkomt syntax errors.
+
+---
+
+## 5. Configure ntpsec (client + server + orphan mode)
+Below is a typical configuration for this use case. Adapt IPs to your environment.
+
+# ntpsec configuration
+driftfile /var/lib/ntpsec/ntp.drift
+leapfile /usr/share/zoneinfo/leap-seconds.list
+
+# Time-of-day system (ToS): accept 1 good source, use orphan mode if no servers
+tos maxclock 11
+tos minclock 1 minsane 1 orphan 10
+
+# UPSTREAM NTP SERVER (IT / plant / customer network)
+# Replace 10.10.10.10 with the real NTP server IP of the customer or dev network
+server 10.10.10.10 iburst
+
+# Access control
+# Default: exchange time with everybody, but forbid reconfiguration
+restrict default kod nomodify nopeer noquery limited
+
+# Local host
+restrict 127.0.0.1
+restrict ::1
+
+# OT / vehicle network: may query time, but not change server settings
+restrict 172.21.35.0 mask 255.255.255.0 nomodify notrap
+
+# Disable Siemens include if it injects example.pool or debian.pool servers:
+#includefile /etc/industrial-os/ntp.conf
+
+Key points:
+
+- `server 10.10.10.10 iburst`  
+  This is the central NTP source (customer NTP, dev NTP, etc.).
+
+- `tos minclock 1 minsane 1 orphan 10`  
+  Accept a single NTP server as valid; if it disappears, the IPC becomes a local time source (orphan, stratum 10).
+
+- `restrict 172.21.35.0 mask 255.255.255.0 nomodify notrap`  
+  Devices in the OT/vehicle network can query time from the IPC but cannot modify NTP settings.
+
+- `#includefile /etc/industrial-os/ntp.conf`  
+  Comment this out if it adds unwanted `example.pool.ntp.org` / `debian.pool.ntp.org` entries that cause DNS errors or extra peers.
+
+NL: Hier stel je de centrale NTP‑server in, definieer je orphan‑mode, en bepaal je welke clients de IPC als NTP‑server mogen gebruiken. De includefile commenteren we uit om extra (ongewenste) servers te vermijden.
+
+---
+
+## 6. Restart ntpsec and verify
+
+### 6.1. Restart and enable the ntpsec service
+sudo systemctl restart ntpsec.service
+sudo systemctl enable ntpsec.service
+
+NL: Herstart de NTP‑service en zorg dat hij automatisch start bij boot.
+
+### 6.2. Check service status
+systemctl status ntpsec.service
+
+You should see:
+
+- `active (running)`
+
+NL: Controleer dat de service actief is en geen fouten meldt.
+
+---
+
+## 7. Verify that the IPC sees the upstream NTP server
+
+### 7.1. Show NTP peers (from the IPC’s perspective)
+ntpq -p
+
+Expected output pattern:
+
+     remote           refid      st t when poll reach   delay   offset   jitter
+===============================================================================
+ 10.10.10.10      <refid>        3  u   5   64   7     1.23    0.123    0.50
+
+Interpretation:
+
+- `reach` > 0 → The IPC is receiving NTP replies from the upstream server.
+- `delay` in the low ms range on LAN is normal.
+- Over time, `offset` should move towards a small value.
+
+NL: `reach > 0` betekent dat de IPC succesvol NTP‑antwoorden krijgt. Delay is de netwerkvertraging; offset is het tijdsverschil.
+
+### 7.2. Check synchronization state
+ntpq -c rv
+
+Look for:
+- `sync_ntp` (instead of `sync_unspec`)
+- `stratum` < 16 (e.g. 4, 5, …)
+- `refid` not equal to `INIT`
+
+Example (good):
+
+... sync_ntp, ...
+stratum=5, ...
+refid=10.10.10.10, ...
+
+If these fields look good, the IPC is actively synchronized to the configured NTP server.
+
+NL: Zodra je `sync_ntp` en een stratum lager dan 16 ziet, volgt de IPC effectief de externe NTP‑server.
+
+---
+
+## 8. IPC as NTP server for the OT / vehicle network
+
+### 8.1. Open UDP/123 on the IPC firewall (if applicable)
+
+If you use UFW:
+sudo ufw allow 123/udp
+sudo ufw status
+
+For other firewalls, allow incoming UDP port 123 from the OT/vehicle subnet.
+
+NL: Zorg dat UDP‑poort 123 openstaat, anders kunnen clients de IPC niet als NTP‑server bereiken.
+
+### 8.2. Configure OT devices to use the IPC as NTP server
+On all devices in the OT network (e.g. `172.21.35.0/24`):
+
+- Set NTP server IP to `172.21.35.12` (the IPC).
+
+Examples:
+- Siemens PLC / HMI (TIA Portal): in CPU time settings, configure NTP server IP = `172.21.35.12`.
+- Linux client in OT network:
+  ntpq -p 172.21.35.12
+  You should see the IPC as an NTP peer.
+
+NL: Stel op alle PLC’s/HMI’s het IP‑adres van de IPC in als NTP‑server. Je kunt vanaf een andere Linux‑machine met `ntpq -p <IPC-IP>` controleren dat de IPC antwoordt.
+
+---
+
+## 9. Operation without an upstream NTP server (orphan mode)
+If no external NTP server is available (temporarily or permanently), the IPC can still act as a local time master:
+
+1. Ensure the `tos orphan 10` part is present in `ntp.conf` (as shown above).
+2. Set the IPC time manually, using a trusted reference (e.g. your laptop):
+
+   sudo timedatectl set-time '2025-11-24 16:20:00'
+
+3. ntpsec will then treat the IPC as an orphaned time source (stratum 10), and OT devices will synchronize to it.
+
+Result:
+
+- All devices in the OT/vehicle network share the same time,
+- even if there is no connection to the central NTP server.
+
+NL: Zonder externe NTP laat je de IPC in orphan‑mode draaien. Je zet één keer handmatig de tijd goed, en alle OT‑componenten synchroniseren daarna op de IPC.
+
+---
+
+## 10. Quick checklist for new projects
+
+NL: Snelle checklist om dit in een nieuw project te herhalen.
+
+1. On the IPC
+   - Login (console/SSH).
+   - Confirm ntpsec is running:
+
+     ps aux | grep ntpsec
+
+   - Backup config:
+
+     sudo cp /etc/ntpsec/ntp.conf /etc/ntpsec/ntp.conf.bak
+
+2. Edit `/etc/ntpsec/ntp.conf`
+   - Set upstream server:
+
+     server <customer-ntp-ip> iburst
+
+   - Make sure:
+
+     tos minclock 1 minsane 1 orphan 10
+     restrict 172.x.y.0 mask 255.255.255.0 nomodify notrap
+     #includefile /etc/industrial-os/ntp.conf
+
+3. Restart and verify
+   - Restart:
+
+     sudo systemctl restart ntpsec.service
+
+   - Verify:
+
+     ntpq -p
+     ntpq -c rv
+
+   - Look for `reach > 0` and `sync_ntp`.
+
+4. Firewall
+   - Open UDP/123 for the OT subnet.
+
+5. Clients
+   - Configure PLCs / HMIs / OT devices: NTP server IP = IPC address.
+
+6. Optional
+   - If no upstream NTP is available, set IPC time manually and rely on orphan mode.
+
